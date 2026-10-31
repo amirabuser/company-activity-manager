@@ -96,7 +96,7 @@ class MainActivity : Activity() {
         }
         web.addJavascriptInterface(Bridge(), "Workspace")
         setContentView(web)
-        web.loadUrl("https://masir.local/")
+        web.loadDataWithBaseURL("https://masir.local/", assets.open("workspace.html").bufferedReader(Charsets.UTF_8).use { it.readText() }, "text/html", "UTF-8", null)
     }
     override fun onSaveInstanceState(out: Bundle) {
         out.putLong("pendingId", pendingId); out.putString("pendingTitle", pendingTitle)
