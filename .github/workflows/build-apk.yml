@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Personal Agent APK
 on:
   push:
     branches: [main]
@@ -17,11 +17,20 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build APK
-        run: gradle --no-daemon :app:assembleDebug --stacktrace
-      - name: Upload APK
+      - name: Reuse debug signing identity
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: personal-agent-debug-signing-v2
+      - name: Compile and check Android app
+        run: gradle --no-daemon :app:assembleDebug :app:lintDebug --stacktrace
+      - name: Name installable APK
+        run: |
+          mkdir -p output
+          cp app/build/outputs/apk/debug/app-debug.apk output/Personal-Agent-2.0.apk
+      - name: Upload Personal Agent APK
         uses: actions/upload-artifact@v4
         with:
-          name: InvoiceTimeline-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Personal-Agent-2.0-APK
+          path: output/Personal-Agent-2.0.apk
           if-no-files-found: error
