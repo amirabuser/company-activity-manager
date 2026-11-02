@@ -1,0 +1,341 @@
+name: Personal Agent v3 - Dark Mode and Safe Delete
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-personal-agent-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-v3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout the existing app
+        uses: actions/checkout@v4
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Reuse v2 debug signing identity for Android updates
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: personal-agent-debug-signing-v2
+      - name: Apply Personal Agent v3 patches (in build only)
+        shell: bash
+        run: |
+          mkdir -p tools
+          cat > tools/upgrade_personal_agent_v3.py <<'PERSONAL_AGENT_V3_PATCH'
+          #!/usr/bin/env python3
+          """Personal Agent v3: upgrade official v2 repo without changing package ID or erasing data.
+          Run at repository root: python3 tools/upgrade_personal_agent_v3.py
+          """
+          from pathlib import Path
+          
+          BASE = Path(__file__).resolve().parents[1]
+          HTML = BASE / 'app/src/main/assets/workspace.html'
+          KOTLIN = BASE / 'app/src/main/java/com/invoicetimeline/app/MainActivity.kt'
+          GRADLE = BASE / 'app/build.gradle.kts'
+          
+          
+          def once(src: str, old: str, new: str, label: str) -> str:
+              count = src.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected 1 anchor, found {count}; source version may have changed')
+              return src.replace(old, new, 1)
+          
+          
+          def change_kotlin(source: str) -> str:
+              s = source
+              s = once(s, 'SQLiteOpenHelper(ctx, "invoices.db", null, 1)', 'SQLiteOpenHelper(ctx, "invoices.db", null, 2)', 'DB version')
+              s = once(s, 'created INTEGER NOT NULL,status TEXT NOT NULL)"', 'created INTEGER NOT NULL,status TEXT NOT NULL,deleted_at INTEGER NOT NULL DEFAULT 0)"', 'Add soft delete on create')
+              s = once(s, 'override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}', '''override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+                  if (oldVersion < 2) db.execSQL("ALTER TABLE records ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0")
+              }''', 'Non-destructive migration')
+              s = once(s, '"SELECT id FROM records WHERE id=?", arrayOf(id.toString())', '"SELECT id FROM records WHERE id=? AND deleted_at=0", arrayOf(id.toString())', 'Prevent events on trashed records')
+              s = once(s, 'put("status", c.getString(5))', 'put("status", c.getString(5)); put("deleted_at", c.getLong(6))', 'Snapshot includes trash state')
+              s = once(s, '''        window.statusBarColor = Color.rgb(248, 247, 244)
+                  window.navigationBarColor = Color.rgb(255, 255, 255)
+                  window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                  web = WebView(this)
+                  web.setBackgroundColor(Color.rgb(248, 247, 244))''', '''        val initialDark = getSharedPreferences("personal_agent_appearance", Context.MODE_PRIVATE).getString("theme", "dark") != "light"
+                  window.statusBarColor = if (initialDark) Color.rgb(27, 29, 32) else Color.rgb(248, 247, 244)
+                  window.navigationBarColor = if (initialDark) Color.rgb(27, 29, 32) else Color.WHITE
+                  window.decorView.systemUiVisibility = if (initialDark) 0 else
+                      android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                  web = WebView(this)
+                  web.setBackgroundColor(if (initialDark) Color.rgb(27, 29, 32) else Color.rgb(248, 247, 244))''', 'System bars and WebView theme')
+              bridge = '''    inner class Bridge {
+                  @JavascriptInterface fun getTheme(): String =
+                      getSharedPreferences("personal_agent_appearance", Context.MODE_PRIVATE).getString("theme", "dark") ?: "dark"
+                  @JavascriptInterface fun setTheme(mode: String) {
+                      if (mode != "dark" && mode != "light") return
+                      getSharedPreferences("personal_agent_appearance", Context.MODE_PRIVATE).edit().putString("theme", mode).apply()
+                      runOnUiThread {
+                          val dark = mode == "dark"
+                          window.statusBarColor = if (dark) Color.rgb(27, 29, 32) else Color.rgb(248, 247, 244)
+                          window.navigationBarColor = if (dark) Color.rgb(27, 29, 32) else Color.WHITE
+                          window.decorView.systemUiVisibility = if (dark) 0 else
+                              android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                          web.setBackgroundColor(if (dark) Color.rgb(27, 29, 32) else Color.rgb(248, 247, 244))
+                      }
+                  }
+                  @JavascriptInterface fun moveToTrash(id: Long): Boolean = try {
+                      if (id <= 0) false else {
+                          val values = ContentValues().apply { put("deleted_at", System.currentTimeMillis()) }
+                          store.writableDatabase.update("records", values, "id=? AND deleted_at=0", arrayOf(id.toString())) == 1
+                      }
+                  } catch (e: Exception) { notifyUser("انتقال به سطل زباله انجام نشد"); false }
+                  @JavascriptInterface fun restoreRecord(id: Long): Boolean = try {
+                      if (id <= 0) false else {
+                          val values = ContentValues().apply { put("deleted_at", 0L) }
+                          store.writableDatabase.update("records", values, "id=? AND deleted_at<>0", arrayOf(id.toString())) == 1
+                      }
+                  } catch (e: Exception) { notifyUser("بازیابی پرونده انجام نشد"); false }
+                  @JavascriptInterface fun purgeRecord(id: Long): Boolean = try {
+                      val db = store.writableDatabase
+                      val images = mutableListOf<String>()
+                      var removed = false
+                      db.beginTransaction()
+                      try {
+                          val exists = db.rawQuery("SELECT 1 FROM records WHERE id=? AND deleted_at<>0", arrayOf(id.toString())).use { it.moveToFirst() }
+                          if (exists) {
+                              db.rawQuery("SELECT photo FROM events WHERE record_id=? AND photo<>''", arrayOf(id.toString())).use { c ->
+                                  while (c.moveToNext()) images.add(c.getString(0))
+                              }
+                              db.delete("events", "record_id=?", arrayOf(id.toString()))
+                              removed = db.delete("records", "id=? AND deleted_at<>0", arrayOf(id.toString())) == 1
+                              if (removed) db.setTransactionSuccessful()
+                          }
+                      } finally { db.endTransaction() }
+                      if (removed) for (photo in images.distinct()) {
+                          val shared = db.rawQuery("SELECT 1 FROM events WHERE photo=? LIMIT 1", arrayOf(photo)).use { it.moveToFirst() }
+                          if (!shared) runCatching { privatePhoto(photo).delete() }
+                      }
+                      removed
+                  } catch (e: Exception) { notifyUser("حذف دائمی انجام نشد"); false }
+          '''
+              s = once(s, '    inner class Bridge {\n', bridge, 'Bridge theme, trash and restore methods')
+              s = once(s, 'FROM records r LEFT JOIN events e ON e.record_id=r.id ORDER BY r.id,e.at,e.id', 'FROM records r LEFT JOIN events e ON e.record_id=r.id WHERE r.deleted_at=0 ORDER BY r.id,e.at,e.id', 'Exclude trash from CSV')
+              # Restore legacy/v3 backup without losing trash states. Events must be inserted before marking records deleted.
+              s = once(s, '''                }; db.setTransactionSuccessful()
+                      } catch(e: Exception) { copied.forEach{it.delete()}; throw e } finally { db.endTransaction() }''', '''                }
+                          for (i in 0 until rs.length()) {
+                              val r = rs.getJSONObject(i)
+                              val deletedAt = r.optLong("deleted_at", 0L)
+                              if (deletedAt > 0L) {
+                                  val newId = mapping[r.getLong("id")] ?: error("شناسه پروندهٔ بکاپ معتبر نیست")
+                                  db.execSQL("UPDATE records SET deleted_at=? WHERE id=?", arrayOf(deletedAt, newId))
+                              }
+                          }
+                          db.setTransactionSuccessful()
+                      } catch(e: Exception) { copied.forEach{it.delete()}; throw e } finally { db.endTransaction() }''', 'Preserve trash state when restoring v3 backup')
+              return s
+          
+          DARK_CSS = r'''
+          /* PERSONAL AGENT v3 — charcoal + original orange; the light palette remains unchanged. */
+          :root[data-theme="dark"]{
+            color-scheme:dark;--bg:#1b1d20;--card:#2a2e32;--ink:#f3f4f3;
+            --muted:#b0b7bd;--line:#454a50;--accent:#f47845;
+            --soft:#3b2c29;--green:#72c2a3;--red:#ec9586;--blue:#a5bee0;
+          }
+          :root[data-theme="dark"] body{background:var(--bg);color:var(--ink);font-size:15px}
+          :root[data-theme="dark"] .round,
+          :root[data-theme="dark"] .stat,
+          :root[data-theme="dark"] .search,
+          :root[data-theme="dark"] .record,
+          :root[data-theme="dark"] .timeline,
+          :root[data-theme="dark"] .action,
+          :root[data-theme="dark"] .report-box,
+          :root[data-theme="dark"] .panel,
+          :root[data-theme="dark"] .option,
+          :root[data-theme="dark"] .outline,
+          :root[data-theme="dark"] .field input,
+          :root[data-theme="dark"] .field select,
+          :root[data-theme="dark"] .field textarea{
+            background:#2a2e32;border-color:#454a50;color:#f3f4f3
+          }
+          :root[data-theme="dark"] .record{box-shadow:0 5px 18px #0000001b}
+          :root[data-theme="dark"] .file-icon,
+          :root[data-theme="dark"] .activity-icon,
+          :root[data-theme="dark"] .empty-icon,
+          :root[data-theme="dark"] .sheet-head button{
+            background:#373c41;color:#e1e5e6
+          }
+          :root[data-theme="dark"] .record-bottom,
+          :root[data-theme="dark"] .activity{border-color:#454a50}
+          :root[data-theme="dark"] .record-bottom time,
+          :root[data-theme="dark"] .qty,
+          :root[data-theme="dark"] .record-title small,
+          :root[data-theme="dark"] .activity p,
+          :root[data-theme="dark"] .bar-label,
+          :root[data-theme="dark"] .field label,
+          :root[data-theme="dark"] .report-box p,
+          :root[data-theme="dark"] .event p,
+          :root[data-theme="dark"] .event time,
+          :root[data-theme="dark"] .sheet-sub,
+          :root[data-theme="dark"] .page-label{color:#b0b7bd}
+          :root[data-theme="dark"] .badge.received{background:#3b434c;color:#c7d2de}
+          :root[data-theme="dark"] .badge.finance{background:#2d435b;color:#b6d7f8}
+          :root[data-theme="dark"] .badge.defect{background:#53382f;color:#f4b49a}
+          :root[data-theme="dark"] .badge.fixed{background:#504530;color:#e2ce94}
+          :root[data-theme="dark"] .badge.paid{background:#294b40;color:#a7e8cd}
+          :root[data-theme="dark"] .bottom{background:#24282df2;border-color:#454a50;box-shadow:0 -10px 28px #0003}
+          :root[data-theme="dark"] .navitem{color:#b5bcc2}
+          :root[data-theme="dark"] .navitem.active{color:var(--accent)}
+          :root[data-theme="dark"] .chip{background:#292d31;color:#d1d5d7;border-color:#454a50}
+          :root[data-theme="dark"] .chip.active{background:var(--accent);border-color:var(--accent);color:#17191b;font-weight:700}
+          :root[data-theme="dark"] .hero,
+          :root[data-theme="dark"] .detail-hero{background:#252931;box-shadow:0 10px 25px #0002}
+          :root[data-theme="dark"] .hero-action{background:#3c424b}
+          :root[data-theme="dark"] .sheet{background:#1b1d20}
+          :root[data-theme="dark"] .handle{background:#666b6f}
+          :root[data-theme="dark"] .steps:before{background:#454a50}
+          :root[data-theme="dark"] .step{color:#b0b7bd}
+          :root[data-theme="dark"] .step span{background:#2a2e32;border-color:#454a50}
+          :root[data-theme="dark"] .step.done span{background:#2c4c3e;border-color:#2c4c3e}
+          :root[data-theme="dark"] .step.current span{background:#49352b;border-color:var(--accent)}
+          :root[data-theme="dark"] .event:before{border-color:#52595f}
+          :root[data-theme="dark"] .event-dot{background:#49352b}
+          :root[data-theme="dark"] .attachment{background:#33383c;color:#e0e4e5;border-color:#454a50}
+          :root[data-theme="dark"] .bar-track{background:#41464a}
+          :root[data-theme="dark"] .empty{background:#24282a;border-color:#52585e;color:#b0b7bd}
+          :root[data-theme="dark"] .empty h3{color:#f3f4f3}
+          :root[data-theme="dark"] .note-box{background:#49352b;color:#f0b9a1}
+          :root[data-theme="dark"] .toast{background:#373d43;color:#fff}
+          :root[data-theme="dark"] .primary,
+          :root[data-theme="dark"] .add-button{color:#18191a;box-shadow:0 6px 15px #0002}
+          :root[data-theme="dark"] .field input::placeholder,
+          :root[data-theme="dark"] .field textarea::placeholder{color:#9ba2a7}
+          :root[data-theme="dark"] .logo{background:#131517}
+          :root[data-theme="dark"] .sheet-overlay{background:#080a0bcc}
+          :root[data-theme="dark"] .round:focus-visible{outline-color:var(--accent)}
+          :root[data-theme="dark"] .danger-zone{border-color:#6d4944}
+          :root[data-theme="dark"] .danger-text{color:#ef9c90}
+          :root[data-theme="light"] .danger-text{color:#bc5348}
+          .trash-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 0;border-bottom:1px solid var(--line)}
+          .trash-row:last-child{border-bottom:0}
+          .trash-row-info{min-width:0;flex:1}
+          .trash-row-info strong{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+          .trash-row-info small{display:block}
+          .trash-row-actions{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+          .trash-row-actions button{border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:11px}
+          .theme-toggle{transition:background .2s,border-color .2s}
+          .theme-toggle svg{width:21px;height:21px}
+          '''
+          
+          JS_ADD = r'''
+          icons.moon='<path d="M20.5 15.5A8.5 8.5 0 0 1 8.5 3.5 8.5 8.5 0 1 0 20.5 15.5Z"/>';
+          icons.trash='<path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6"/>';
+          icons.restore='<path d="M4 11a8 8 0 1 1 2.4 5.7M4 5v6h6M12 8v5l3 2"/>';
+          '''
+          
+          JS_FUNCTIONS = r'''
+          function activeRecords(){return db.records.filter(r=>!(Number(r.deleted_at)>0))}
+          function trashedRecords(){return db.records.filter(r=>Number(r.deleted_at)>0)}
+          let theme='dark';
+          try{theme=Workspace.getTheme()==='light'?'light':'dark'}catch(e){}
+          document.documentElement.dataset.theme=theme;
+          function toggleTheme(){theme=theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;try{Workspace.setTheme(theme)}catch(e){}render(false)}
+          function askTrash(id){const r=activeRecords().find(x=>x.id===id);if(!r)return;current=id;sheet('انتقال به سطل زباله','مرحله اول: پرونده از فهرست و گزارش‌ها پنهان می‌شود، اما قابل بازیابی است.','<div class="note-box">پرونده '+fa(r.id)+' • '+esc(r.printer)+' • '+esc(r.province)+'</div><button class="primary block" data-act="trash-confirm" data-id="'+id+'">'+I('trash')+'بله، انتقال به سطل زباله</button><button class="outline block" style="margin-top:10px" data-act="close">انصراف</button>')}
+          function trash(){const rs=trashedRecords();return header()+'<div class="intro"><div><div class="page-label">RECYCLE BIN</div><h1>سطل زباله</h1></div><small>'+fa(rs.length)+' پرونده</small></div><p class="muted" style="margin-bottom:18px">پرونده‌های این بخش در گزارش‌های فعال حساب نمی‌شوند. می‌توانی آن‌ها را بازیابی کنی یا با تأیید دوباره برای همیشه حذف کنی.</p><section class="panel">'+(rs.length?rs.map(r=>'<div class="trash-row"><div class="trash-row-info"><strong>'+esc(r.printer)+'</strong><small>'+esc(r.province)+' • پرونده '+fa(r.id)+'</small></div><div class="trash-row-actions"><button data-act="restore-record" data-id="'+r.id+'">'+I('restore')+' بازیابی</button><button class="danger-text" data-act="purge-start" data-id="'+r.id+'">'+I('trash')+' حذف</button></div></div>').join(''):'<p class="muted">سطل زباله خالی است.</p>')+'</section><button class="outline block" data-page="tools" style="margin-top:15px">بازگشت به ابزارها</button>'}
+          function askPurge(id){const r=trashedRecords().find(x=>x.id===id);if(!r)return;sheet('حذف دائمی پرونده','تأیید اول از دو تأیید حذف دائمی: اطلاعات و رویدادهای این پرونده دیگر قابل بازیابی نیستند.','<div class="note-box">'+esc(r.printer)+' • پرونده '+fa(r.id)+'</div><button class="primary block" data-act="purge-review" data-id="'+r.id+'">ادامه برای تأیید نهایی</button><button class="outline block" data-act="close" style="margin-top:10px">انصراف</button>')}
+          function confirmPurge(id){const r=trashedRecords().find(x=>x.id===id);if(!r)return;sheet('تأیید نهایی حذف','برای حذف غیرقابل‌بازیابی، کلمه «حذف» را تایپ کن.','<div class="field"><label for="purge-phrase">تأیید حذف پرونده '+fa(r.id)+'</label><input id="purge-phrase" autocomplete="off" placeholder="حذف" maxlength="12"></div><p class="error" id="purge-error" role="alert"></p><button class="primary block" data-act="purge-confirm" data-id="'+r.id+'">حذف دائمی و غیرقابل بازگشت</button><button class="outline block" data-act="close" style="margin-top:10px">انصراف</button>')}
+          function handleSafeDeleteAction(b){const id=Number(b.dataset.id);const action=b.dataset.act;
+           if(action==='toggle-theme'){toggleTheme();return true}
+           if(action==='trash-record'){askTrash(id);return true}
+           if(action==='trash-confirm'){if(Workspace.moveToTrash(id)){closeSheet();page='records';load();nativeMessage('پرونده به سطل زباله منتقل شد')}else nativeMessage('انتقال انجام نشد');return true}
+           if(action==='restore-record'){if(Workspace.restoreRecord(id)){load();nativeMessage('پرونده بازیابی شد')}else nativeMessage('بازیابی انجام نشد');return true}
+           if(action==='purge-start'){askPurge(id);return true}
+           if(action==='purge-review'){confirmPurge(id);return true}
+           if(action==='purge-confirm'){if(($('purge-phrase')?.value||'').trim()!=='حذف'){$('purge-error').textContent='برای تأیید، کلمه حذف را وارد کن';return true}if(Workspace.purgeRecord(id)){closeSheet();page='trash';load();nativeMessage('پرونده به‌صورت دائمی حذف شد')}else nativeMessage('حذف انجام نشد');return true}
+           return false;
+          }
+          '''
+          
+          
+          def change_html(source: str) -> str:
+              s = source
+              s = once(s, '</style>', DARK_CSS + '\n</style>', 'Insert dark theme styles')
+              s = once(s, 'const I=(name)=>', JS_ADD + '\nconst I=(name)=>', 'Add moon/trash/restore icons')
+              s = once(s, 'const bridge=()=>window.Workspace;', 'const bridge=()=>window.Workspace;\n'+JS_FUNCTIONS, 'Theme and trash operations')
+              # All existing lists/statistics now operate on active records, while backup still includes trash.
+              s = s.replace('db.records', 'activeRecords()')
+              # Restore actual raw db references in the two helper functions we just inserted.
+              s = once(s, 'function activeRecords(){return activeRecords().filter(', 'function activeRecords(){return db.records.filter(', 'Fix active records helper')
+              s = once(s, 'function trashedRecords(){return activeRecords().filter(', 'function trashedRecords(){return db.records.filter(', 'Fix trash helper')
+              s = once(s, '<button class="round" aria-label="پشتیبان و تنظیمات" data-page="tools">\'+I(\'shield\')+\'</button>', '<button class="round theme-toggle" aria-label="تغییر حالت تیره و روشن" title="تغییر تم" data-act="toggle-theme">\'+I(theme===\'dark\'?\'sun\':\'moon\')+\'</button>', 'Replace shield with theme toggle')
+              s = once(s, "+'</section>'}\nfunction reports()", "+'</section><section class=\"panel danger-zone\"><h3>'+I('trash')+' مدیریت پرونده</h3><p>برای حذف امن، پرونده ابتدا به سطل زباله منتقل می‌شود.</p><button class=\"outline block danger-text\" data-act=\"trash-record\" data-id=\"'+r.id+'\">'+I('trash')+' انتقال به سطل زباله</button></section>'}\nfunction reports()", 'Add delete action to detail')
+              s = once(s,
+                  "<section class=\"panel\"><h3>'+I('box')+'فضای شخصی و آفلاین</h3>",
+                  "<section class=\"panel\"><h3>'+I('trash')+'سطل زباله</h3><p>حذف امن و امکان بازیابی پرونده‌ها.</p><button class=\"outline block\" data-page=\"trash\">'+I('trash')+'مدیریت سطل زباله ('+fa(trashedRecords().length)+')</button></section><section class=\"panel\"><h3>'+I('box')+'فضای شخصی و آفلاین</h3>",
+                  'Add trash entry to tools')
+              s = once(s, "page==='reports'?reports():tools()", "page==='reports'?reports():page==='trash'?trash():tools()", 'Render trash screen')
+              s = once(s, "if(b.dataset.page){page=b.dataset.page;", "if(handleSafeDeleteAction(b))return;if(b.dataset.page){page=b.dataset.page;", 'Handle theme and deletion clicks')
+              s = once(s, 'نسخهٔ ۲.۰', 'نسخهٔ ۳.۰', 'UI version label')
+              return s
+          
+          
+          def run():
+              if not HTML.is_file() or not KOTLIN.is_file() or not GRADLE.is_file():
+                  raise SystemExit('Run this script at the root of the original Personal Agent repository')
+              source_html = HTML.read_text(encoding='utf-8')
+              source_kotlin = KOTLIN.read_text(encoding='utf-8')
+              source_gradle = GRADLE.read_text(encoding='utf-8')
+              if 'Personal Agent v3' in source_html or 'deleted_at INTEGER NOT NULL DEFAULT 0' in source_kotlin:
+                  raise SystemExit('v3 already applied; refusing to apply patches twice')
+              html = change_html(source_html)
+              kotlin = change_kotlin(source_kotlin)
+              gradle = once(source_gradle, 'versionCode = 2; versionName = "2.0"', 'versionCode = 3; versionName = "3.0"', 'Increase app version')
+              assert 'com.invoicetimeline.app' in kotlin and 'applicationId = "com.invoicetimeline.app"' in gradle
+              assert 'deleted_at' in kotlin and 'getTheme' in kotlin and 'purgeRecord' in kotlin
+              assert 'theme-toggle' in html and 'trash()' in html and 'activeRecords()' in html
+              HTML.write_text(html, encoding='utf-8')
+              KOTLIN.write_text(kotlin, encoding='utf-8')
+              GRADLE.write_text(gradle, encoding='utf-8')
+              print('OK: Personal Agent v3 upgrade applied (dark/light + recycle bin + two-stage permanent delete).')
+          
+          if __name__ == '__main__':
+              run()
+          PERSONAL_AGENT_V3_PATCH
+          python3 tools/upgrade_personal_agent_v3.py
+      - name: Validate JavaScript syntax and essential modifications
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('app/src/main/assets/workspace.html').read_text()
+          js=s.split('<script>',1)[1].split('</script>',1)[0]
+          Path('/tmp/personal-agent-v3.js').write_text(js)
+          assert 'data-act="toggle-theme"' in s
+          assert 'data-act="trash-record"' in s
+          assert 'data-act="purge-confirm"' in s
+          assert 'function trash()' in s
+          PY
+          node --check /tmp/personal-agent-v3.js
+      - name: Build and lint Android APK
+        run: gradle --no-daemon :app:assembleDebug :app:lintDebug --stacktrace
+      - name: Prepare APK and upgraded source
+        shell: bash
+        run: |
+          mkdir -p output
+          cp app/build/outputs/apk/debug/app-debug.apk output/Personal-Agent-v3.0.apk
+          zip -q -r output/Personal-Agent-v3-Updated-Sources.zip app/src/main/assets/workspace.html app/src/main/java/com/invoicetimeline/app/MainActivity.kt app/build.gradle.kts
+          sha256sum output/* > output/SHA256SUMS.txt
+      - name: Upload installable APK + actual modified source files
+        uses: actions/upload-artifact@v4
+        with:
+          name: Personal-Agent-v3-APK-and-Source
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
